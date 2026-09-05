@@ -1,0 +1,399 @@
+// Prisma schema para o bot de vendas no Telegram
+// Banco de dados: PostgreSQL
+// Todas as entidades são persistidas e representam o estado real do sistema.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ==============================================
+// ENUMS
+// ==============================================
+
+enum UserStatus {
+  ACTIVE
+  BLOCKED
+  BANNED
+}
+
+enum OrderStatus {
+  PENDING          // aguardando pagamento
+  PAID             // pagamento confirmado
+  DELIVERED        // produto entregue
+  CANCELED         // cancelado
+  EXPIRED          // pagamento expirado
+}
+
+enum PaymentStatus {
+  PENDING          // aguardando confirmação
+  APPROVED         // aprovado pelo gateway
+  REJECTED         // rejeitado
+  EXPIRED          // expirado
+  CANCELED         // cancelado
+}
+
+enum PaymentMethod {
+  PIX
+  // futuramente: CREDIT_CARD, BOLETO
+}
+
+enum GiftCardStatus {
+  ACTIVE
+  USED
+  EXPIRED
+  DISABLED
+}
+
+enum AffiliateCommissionStatus {
+  PENDING
+  PAID
+  CANCELED
+}
+
+enum WithdrawalStatus {
+  PENDING          // aguardando processamento
+  PROCESSING       // em processamento no provedor
+  COMPLETED        // concluído com sucesso
+  FAILED           // falhou
+  CANCELED         // cancelado pelo usuário/admin
+}
+
+enum BlockType {
+  PAYMENT_ATTEMPT   // bloqueio por excesso de tentativas de pagamento
+  ADMIN_MANUAL      // bloqueio manual por administrador
+  FRAUD_SUSPICION   // suspeita de fraude
+  OTHER
+}
+
+enum BlockStatus {
+  ACTIVE
+  EXPIRED
+  REMOVED
+}
+
+enum TransactionType {
+  CREDIT           // entrada de saldo
+  DEBIT            // saída de saldo
+}
+
+enum StockMovementType {
+  IN               // entrada
+  OUT              // saída
+  RESERVE          // reserva
+  CANCEL_RESERVE   // cancelamento de reserva
+}
+
+enum ReservationStatus {
+  ACTIVE
+  CONSUMED
+  CANCELED
+  EXPIRED
+}
+
+enum WebhookEventStatus {
+  RECEIVED
+  PROCESSED
+  PROCESSING
+  FAILED
+}
+
+// ==============================================
+// MODELOS
+// ==============================================
+
+model User {
+  id            Int         @id @default(autoincrement())
+  telegramId    BigInt      @unique
+  username      String?
+  firstName     String?
+  lastName      String?
+  status        UserStatus  @default(ACTIVE)
+  balance       Decimal     @default(0) @db.Decimal(12, 2)
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+
+  orders         Order[]
+  payments       Payment[]
+  giftCardsUsed  GiftCard[]
+  withdrawals    Withdrawal[]
+  blocks         Block[]
+  transactions   Transaction[]
+  reservations   Reservation[]
+  affiliate      Affiliate?
+  commissions    Commission[]       // comissões ganhas como afiliado (via affiliateId)
+  clicks         AffiliateClick[]
+
+  @@map("users")
+}
+
+model Product {
+  id          Int      @id @default(autoincrement())
+  name        String
+  description String?
+  price       Decimal  @db.Decimal(12, 2)
+  stock       Int      @default(0)
+  active      Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  orderItems    OrderItem[]
+  stockMoves    StockMovement[]
+  reservations  Reservation[]
+
+  @@map("products")
+}
+
+model Order {
+  id          Int         @id @default(autoincrement())
+  userId      Int
+  user        User        @relation(fields: [userId], references: [id])
+  status      OrderStatus @default(PENDING)
+  total       Decimal     @db.Decimal(12, 2)
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+  paidAt      DateTime?
+  deliveredAt DateTime?
+  canceledAt  DateTime?
+  expiresAt   DateTime?   // para expiração de pagamento
+
+  items       OrderItem[]
+  payments    Payment[]
+  commissions Commission[]   // comissões de afiliados geradas por este pedido
+  reservation Reservation?   // reserva de estoque vinculada (se houver)
+
+  @@index([userId])
+  @@map("orders")
+}
+
+model OrderItem {
+  id        Int     @id @default(autoincrement())
+  orderId   Int
+  order     Order   @relation(fields: [orderId], references: [id])
+  productId Int
+  product   Product @relation(fields: [productId], references: [id])
+  quantity  Int
+  unitPrice Decimal @db.Decimal(12, 2)   // preço unitário no momento da compra (snapshot)
+  name      String  // nome do produto no momento da compra
+
+  @@map("order_items")
+}
+
+model Payment {
+  id            Int           @id @default(autoincrement())
+  orderId       Int
+  order         Order         @relation(fields: [orderId], references: [id])
+  userId        Int
+  user          User          @relation(fields: [userId], references: [id])
+  method        PaymentMethod @default(PIX)
+  status        PaymentStatus @default(PENDING)
+  amount        Decimal       @db.Decimal(12, 2)
+  externalId    String?       @unique   // ID do pagamento no Mercado Pago
+  qrCode        String?                 // QR Code em texto (copia e cola)
+  qrCodeBase64  String?                 // QR Code em imagem base64
+  expirationDate DateTime?
+  webhookData   Json?                    // dados brutos recebidos no webhook
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+  approvedAt    DateTime?
+
+  @@index([userId])
+  @@map("payments")
+}
+
+model GiftCard {
+  id             Int            @id @default(autoincrement())
+  code           String         @unique
+  initialValue   Decimal        @db.Decimal(12, 2)
+  remainingValue Decimal        @db.Decimal(12, 2)
+  status         GiftCardStatus @default(ACTIVE)
+  expiresAt      DateTime?
+  createdByUserId Int?          // admin que criou
+  usedByUserId   Int?
+  usedByUser     User?          @relation("GiftCardUsedBy", fields: [usedByUserId], references: [id])
+  usedAt         DateTime?
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+
+  @@index([status])
+  @@map("gift_cards")
+}
+
+model Affiliate {
+  id                Int      @id @default(autoincrement())
+  userId            Int      @unique
+  user              User     @relation(fields: [userId], references: [id])
+  code              String   @unique
+  commissionPercent Decimal  @default(5) @db.Decimal(5, 2)   // percentual de comissão
+  totalEarned       Decimal  @default(0) @db.Decimal(12, 2)
+  balance           Decimal  @default(0) @db.Decimal(12, 2)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  clicks      AffiliateClick[]
+  commissions Commission[]
+
+  @@map("affiliates")
+}
+
+model AffiliateClick {
+  id           Int      @id @default(autoincrement())
+  affiliateId  Int
+  affiliate    Affiliate @relation(fields: [affiliateId], references: [id])
+  clickedByUserId Int?   // ID do usuário que clicou (se conhecido)
+  ipAddress    String?
+  userAgent    String?
+  createdAt    DateTime @default(now())
+
+  @@index([affiliateId])
+  @@map("affiliate_clicks")
+}
+
+model Commission {
+  id            Int                       @id @default(autoincrement())
+  affiliateId   Int
+  affiliate     Affiliate                 @relation(fields: [affiliateId], references: [id])
+  orderId       Int
+  order         Order                     @relation(fields: [orderId], references: [id])
+  amount        Decimal                   @db.Decimal(12, 2)
+  status        AffiliateCommissionStatus @default(PENDING)
+  createdAt     DateTime                  @default(now())
+  paidAt        DateTime?
+
+  @@index([affiliateId])
+  @@map("commissions")
+}
+
+model Withdrawal {
+  id          Int              @id @default(autoincrement())
+  userId      Int
+  user        User             @relation(fields: [userId], references: [id])
+  amount      Decimal          @db.Decimal(12, 2)
+  status      WithdrawalStatus @default(PENDING)
+  pixKey      String           // chave Pix para recebimento
+  externalId  String?          @unique   // ID da transação no provedor de saque
+  failureReason String?
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+  processedAt DateTime?
+
+  @@index([userId])
+  @@map("withdrawals")
+}
+
+model Block {
+  id          Int         @id @default(autoincrement())
+  userId      Int
+  user        User        @relation(fields: [userId], references: [id])
+  type        BlockType   @default(PAYMENT_ATTEMPT)
+  status      BlockStatus @default(ACTIVE)
+  reason      String?
+  startsAt    DateTime    @default(now())
+  endsAt      DateTime?   // se nulo, bloqueio permanente até remoção manual
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+
+  @@index([userId, status])
+  @@map("blocks")
+}
+
+model Transaction {
+  id             Int             @id @default(autoincrement())
+  userId         Int
+  user           User            @relation(fields: [userId], references: [id])
+  type           TransactionType
+  amount         Decimal         @db.Decimal(12, 2)   // sempre positivo; tipo indica direção
+  balanceBefore  Decimal         @db.Decimal(12, 2)
+  balanceAfter   Decimal         @db.Decimal(12, 2)
+  description    String
+  referenceId    Int?            // ID de referência (orderId, withdrawalId, etc.)
+  referenceType  String?         // tipo da referência (ex: 'order', 'withdrawal', 'giftcard')
+  createdAt      DateTime        @default(now())
+
+  @@index([userId])
+  @@map("transactions")
+}
+
+model StockMovement {
+  id          Int               @id @default(autoincrement())
+  productId   Int
+  product     Product           @relation(fields: [productId], references: [id])
+  type        StockMovementType
+  quantity    Int               // positivo para entrada/saída, pode ser negativo em OUT
+  referenceId Int?
+  referenceType String?
+  createdAt   DateTime          @default(now())
+
+  @@index([productId])
+  @@map("stock_movements")
+}
+
+model Reservation {
+  id          Int               @id @default(autoincrement())
+  userId      Int
+  user        User              @relation(fields: [userId], references: [id])
+  productId   Int
+  product     Product           @relation(fields: [productId], references: [id])
+  orderId     Int?              @unique   // se vinculado a um pedido, único (1 reserva por pedido)
+  order       Order?            @relation(fields: [orderId], references: [id])
+  quantity    Int
+  status      ReservationStatus @default(ACTIVE)
+  expiresAt   DateTime
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+
+  @@index([userId, productId])
+  @@index([status, expiresAt])
+  @@map("reservations")
+}
+
+model Settings {
+  key         String   @id
+  value       String
+  description String?
+  updatedAt   DateTime @updatedAt
+
+  @@map("settings")
+}
+
+model WebhookEvent {
+  id            Int                @id @default(autoincrement())
+  provider      String             // ex: 'mercadopago'
+  eventId       String             @unique // ID único do evento no provedor
+  type          String             // ex: 'payment.created', 'payment.updated'
+  payload       Json
+  status        WebhookEventStatus @default(RECEIVED)
+  processedAt   DateTime?
+  errorMessage  String?
+  createdAt     DateTime           @default(now())
+  updatedAt     DateTime           @updatedAt
+
+  @@index([provider, eventId])
+  @@map("webhook_events")
+}
+
+model IdempotencyKey {
+  key         String   @id
+  operation   String
+  createdAt   DateTime @default(now())
+  expiresAt   DateTime?
+
+  @@map("idempotency_keys")
+}
+
+model OperationState {
+  id          String   @id   // UUID ou identificador da operação
+  type        String   // tipo: 'checkout', 'payment', 'withdrawal', etc.
+  userId      Int?
+  data        Json
+  status      String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  completedAt DateTime?
+
+  @@map("operation_states")
+}
