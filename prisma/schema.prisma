@@ -119,14 +119,15 @@ model User {
 
   orders         Order[]
   payments       Payment[]
-  giftCardsUsed  GiftCard[]
+  giftCardsUsed  GiftCard[]    @relation("GiftCardUsedBy")
   withdrawals    Withdrawal[]
   blocks         Block[]
   transactions   Transaction[]
   reservations   Reservation[]
   affiliate      Affiliate?
-  commissions    Commission[]       // comissões ganhas como afiliado (via affiliateId)
-  clicks         AffiliateClick[]
+
+  // Removidos: commissions e clicks, pois não há relação direta com User.
+  // Comissões e cliques são acessados via Affiliate.
 
   @@map("users")
 }
@@ -245,6 +246,7 @@ model AffiliateClick {
   affiliateId  Int
   affiliate    Affiliate @relation(fields: [affiliateId], references: [id])
   clickedByUserId Int?   // ID do usuário que clicou (se conhecido)
+  // Sem relação com User para simplificar; apenas armazenamos o ID se necessário.
   ipAddress    String?
   userAgent    String?
   createdAt    DateTime @default(now())
@@ -264,6 +266,8 @@ model Commission {
   createdAt     DateTime                  @default(now())
   paidAt        DateTime?
 
+  // Garante que não haja comissão duplicada para o mesmo pedido e afiliado
+  @@unique([orderId, affiliateId])
   @@index([affiliateId])
   @@map("commissions")
 }
@@ -280,6 +284,9 @@ model Withdrawal {
   createdAt   DateTime         @default(now())
   updatedAt   DateTime         @updatedAt
   processedAt DateTime?
+
+  // Chave de idempotência para evitar saques duplicados em caso de retry
+  idempotencyKey String?       @unique
 
   @@index([userId])
   @@map("withdrawals")
