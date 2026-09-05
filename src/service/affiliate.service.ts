@@ -1,6 +1,6 @@
 import { prisma } from '../lib/prisma';
 import logger from '../lib/logger';
-import { AffiliateCommissionStatus, Prisma } from '@prisma/client';
+import { AffiliateCommissionStatus, Prisma, TransactionType } from '@prisma/client';
 
 // ==============================================
 // TIPOS AUXILIARES
@@ -21,7 +21,7 @@ interface RecordClickInput {
 interface ProcessCommissionInput {
   orderId: number;
   affiliateId: number;
-  orderTotal: number;
+  // Removido orderTotal – passaremos a buscar o total real da order no banco
 }
 
 // ==============================================
@@ -74,8 +74,7 @@ export async function createAffiliate(
       return affiliate;
     } catch (error: any) {
       if (error?.code === 'P2002') {
-        // Pode ser conflito de código ou de userId (unique)
-        // Se for userId, não adianta tentar de novo
+        // Se a violação for no campo userId, não adianta tentar de novo
         if (error?.meta?.target?.includes('userId')) {
           throw new Error('Usuário já é afiliado.');
         }
@@ -138,47 +137,26 @@ export async function recordClick(input: RecordClickInput): Promise<void> {
 
 /**
  * Processa a comissão de um pedido pago para um determinado afiliado.
- * - Idempotente: se já existir uma comissão para o par (orderId, affiliateId), não cria outra.
- * - Protegido contra concorrência: uso de transação e verificação dentro dela, além de
- *   captura de violação de unicidade (P2002) caso a constraint única exista.
- * - Calcula o valor com base no percentual do afiliado.
- * - Atualiza o saldo e total ganho do afiliado atomicamente.
- * - Cria registro de comissão com status PENDING.
- *
- * IMPORTANTE: Para máxima segurança, adicione uma restrição única no schema do Prisma:
- *   model Commission {
- *     ...
- *     @@unique([orderId, affiliateId])
- *   }
- *   E rode uma migração. Enquanto isso, a transação mitiga a duplicação.
+ * 
+ * Correções implementadas:
+ * - Busca o total real do pedido dentro da transação (não aceita valor de fora).
+ * - Calcula o valor da comissão usando Decimal (precisão de centavos).
+ * - Cria registro de Transaction (livro-caixa) para auditoria do saldo do afiliado.
+ * - Idempotente e protegido contra duplicação (verificação + constraint única).
  */
 export async function processCommission(
   input: ProcessCommissionInput
 ): Promise<Prisma.CommissionGetPayload<{}> | null> {
-  const { orderId, affiliateId, orderTotal } = input;
-
-  // Busca o afiliado para obter o percentual
-  const affiliate = await prisma.affiliate.findUnique({
-    where: { id: affiliateId },
-  });
-  if (!affiliate) {
-    throw new Error('Afiliado não encontrado.');
-  }
-
-  const amount = (orderTotal * affiliate.commissionPercent.toNumber()) / 100;
+  const { orderId, affiliateId } = input;
 
   try {
-    // Transação para garantir que a verificação de existência e a criação
-    // ocorram atomicamente (evita duplicação por corrida)
+    // Transação completa: busca da order, cálculo, criação da comissão,
+    // atualização do afiliado e criação da transação de auditoria.
     return await prisma.$transaction(async (tx) => {
-      // Verifica se a comissão já existe dentro da transação
+      // 1. Verifica se a comissão já existe (idempotência)
       const existingCommission = await tx.commission.findFirst({
-        where: {
-          orderId,
-          affiliateId,
-        },
+        where: { orderId, affiliateId },
       });
-
       if (existingCommission) {
         logger.info(
           { orderId, affiliateId, commissionId: existingCommission.id },
@@ -187,7 +165,37 @@ export async function processCommission(
         return existingCommission;
       }
 
-      // Cria a comissão
+      // 2. Busca o afiliado
+      const affiliate = await tx.affiliate.findUnique({
+        where: { id: affiliateId },
+      });
+      if (!affiliate) {
+        throw new Error('Afiliado não encontrado.');
+      }
+
+      // 3. Busca o pedido para obter o total real
+      const order = await tx.order.findUnique({
+        where: { id: orderId },
+        select: { total: true, status: true },
+      });
+      if (!order) {
+        throw new Error('Pedido não encontrado.');
+      }
+
+      // Garante que o pedido esteja pago? (pode ser opcional, mas recomendável)
+      // Se necessário, valide: if (order.status !== 'PAID') throw new Error('Pedido não está pago.');
+
+      const orderTotal = order.total; // Decimal
+
+      // 4. Calcula a comissão com precisão decimal
+      // affiliate.commissionPercent é Decimal (ex: 5.00)
+      // amount = orderTotal * commissionPercent / 100
+      const amount = orderTotal
+        .mul(affiliate.commissionPercent)
+        .div(100)
+        .toDecimalPlaces(2); // arredonda para centavos
+
+      // 5. Cria a comissão
       const commission = await tx.commission.create({
         data: {
           affiliateId,
@@ -197,32 +205,46 @@ export async function processCommission(
         },
       });
 
-      // Atualiza o afiliado: incrementa totalEarned e balance
-      await tx.affiliate.update({
+      // 6. Atualiza o saldo e total ganho do afiliado (incremento decimal)
+      const updatedAffiliate = await tx.affiliate.update({
         where: { id: affiliateId },
         data: {
           totalEarned: { increment: amount },
           balance: { increment: amount },
         },
+        select: { balance: true, totalEarned: true },
+      });
+
+      // 7. Cria a transação de auditoria (livro-caixa do afiliado)
+      // Observação: Transaction está ligada ao usuário (userId).
+      // Usaremos o userId do afiliado, e os campos balanceBefore/balanceAfter
+      // refletirão o saldo do afiliado (não o saldo da carteira normal).
+      await tx.transaction.create({
+        data: {
+          userId: affiliate.userId,
+          type: TransactionType.CREDIT,
+          amount,
+          balanceBefore: affiliate.balance,      // saldo do afiliado antes
+          balanceAfter: updatedAffiliate.balance, // saldo do afiliado depois
+          description: `Comissão de afiliado pedido #${orderId}`,
+          referenceId: commission.id,
+          referenceType: 'affiliate_commission',
+        },
       });
 
       logger.info(
-        { commissionId: commission.id, orderId, affiliateId, amount },
-        'Comissão processada e saldo do afiliado atualizado.'
+        { commissionId: commission.id, orderId, affiliateId, amount: amount.toString() },
+        'Comissão processada e registrada no livro-caixa.'
       );
 
       return commission;
     });
   } catch (error: any) {
-    // Se houver violação de unicidade (caso a constraint única exista),
-    // significa que outra transação criou a comissão simultaneamente.
-    // Nesse caso, retornamos a comissão existente em vez de lançar erro.
+    // Se houver violação de unicidade (P2002) durante a criação, pode ser que outra
+    // transação tenha criado a comissão simultaneamente. Nesse caso, tenta buscar a existente.
     if (error?.code === 'P2002') {
       const existing = await prisma.commission.findFirst({
-        where: {
-          orderId,
-          affiliateId,
-        },
+        where: { orderId, affiliateId },
       });
       if (existing) {
         logger.warn(
